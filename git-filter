@@ -1,0 +1,1828 @@
+#!/usr/bin/python
+#
+# A tool for defining and applying "filters" that map between different
+# "profiles" of the same project. Development can proceed on both sides of a
+# filter simultaneously and changes mapped across the filter automatically.
+#
+# Copyright (c) 2015-2016 Troy Moure
+
+import gzip
+import pickle
+import os
+import subprocess
+import sys
+
+from binascii import hexlify, unhexlify
+
+# Enable to print debug messages to stderr.
+ENABLE_TRACING = os.environ.get('GIT_FILTER_TRACE', False)
+
+# If set, when writing filtered commits we will endeavour to preserve all commit
+# metadata exactly, including malformed author/committer informations, commit
+# signatures, etc. This doesn't normally make sense (commit signatures will not
+# validate, etc.), but it is useful for testing.
+PRESERVE_ALL_METADATA = os.environ.get('GIT_FILTER_PRESERVE_ALL_METADATA', False)
+
+# Globals filled in early in main()
+git_dir      = None
+program_args = None
+continuing   = False   # for '--continue'
+
+
+########################################################################
+##  Helper Functions
+
+def say(msg):
+    sys.stderr.write("%s\n" % msg)
+
+def die(msg):
+    say("fatal: %s" % msg)
+    sys.exit(1)
+
+def warn(msg):
+    say("warning: %s" % msg)
+
+# Format byte string for printing.
+def pr(bytes):
+    return bytes.decode('utf-8', 'replace')
+
+def pr_hex(bytes):
+    return pr(hexlify(bytes))
+
+def nop(*args, **kw_args):
+    pass
+
+# Debug tracing
+if ENABLE_TRACING:
+    g_trace_indent = 0
+
+    def trace(msg):
+        say("TRACE: " + "  " * g_trace_indent + msg)
+
+    def trace_enter(msg = None):
+        global g_trace_indent
+        if msg:
+            trace(msg)
+        g_trace_indent += 1
+
+    def trace_exit(msg = None):
+        global g_trace_indent
+        if msg:
+            trace(msg)
+        g_trace_indent -= 1
+else:
+    trace       = nop
+    trace_enter = nop
+    trace_exit  = nop
+
+# Join strings, separating them with the single character 'sep'. Occurrences of
+# 'sep' and backlash characters within the input strings are backslashed-escaped
+# in the output.
+def join_strings(strings, sep):
+    return sep.join(s.replace(b'\\', b'\\\\').replace(sep, b'\\' + sep) for s in strings)
+
+# Separate strings joined with 'join_strings'.
+def separate_strings(joined, sep):
+    backslash, sep = ord(b'\\'), ord(sep)
+    strings = []
+    start, j = 0, 0
+    while j < len(joined):
+        if joined[j] == sep:
+            strings.append(joined[start:j])
+            start = j + 1
+        elif joined[j] == backslash:
+            joined = joined[:j] + joined[j+1:]
+            if j == len(joined):
+                raise ValueError("stray '\\'")
+            elif joined[j] not in [backslash, sep]:
+                raise ValueError("invalid escape sequence '\\%s'" % pr(joined[j]))
+        j += 1
+    strings.append(joined[start:j])
+    return strings
+
+# Stop because user action is required.
+def interrupt(config, msg):
+    if config:
+        config.save_cache_if_dirty()
+    with open(git_dir + b'/FILTER_CMD', 'w') as f:
+        f.buffer.write(join_strings(program_args, b' '))
+    sys.stderr.write(msg + '\n')
+    sys.exit(2)
+
+# Wrapper around subprocess.Popen.
+PIPE_STDIN  = 1
+PIPE_STDOUT = 2
+PIPE_STDERR = 4
+def popen(args, flags = 0, env = None):
+    inp = subprocess.PIPE if (flags & PIPE_STDIN)  else None
+    out = subprocess.PIPE if (flags & PIPE_STDOUT) else None
+    err = subprocess.PIPE if (flags & PIPE_STDERR) else None
+
+    # Arguments that are actual user-supplied filenames, etc., should be byte
+    # sequences already. Other arguments should just be basic words written in
+    # the source code of this script, which don't need anything fancier than
+    # ASCII.
+    for i in range(len(args)):
+        if type(args[i]) is str:
+            args[i] = args[i].encode('ascii')
+
+    trace("--> " + " ".join([pr(arg) for arg in args]))
+
+    p = subprocess.Popen(args, stdin=inp, stdout=out, stderr=err, env=env)
+    p.args_ = args
+    return p
+
+# Wait for process to finish execution and return exit code.
+def join_(p):
+    p.wait()
+    return p.returncode
+
+def command_failed(p):
+    die("command failed: %s" % " ".join([pr(arg) for arg in p.args_]))
+
+# Wait for process to finish execution and fail if it returns non-zero.
+def join(p):
+    if join_(p) != 0:
+        command_failed(p)
+
+# Run the given command and return exit code.
+def run_test(args, flags = 0, env = None):
+    return join_(popen(args, flags, env))
+
+# Run the given command and exit if it fails.
+def run(args, flags = 0, env = None):
+    join(popen(args, flags, env))
+
+# Run the given command and return the output (fail if it returns a non-zero
+# exit status).
+def run_output(args):
+    p = popen(args, PIPE_STDOUT)
+    output = p.stdout.read()
+    join(p)
+    return output
+
+def get_git_dir():
+    p = popen(['git', 'rev-parse', '--git-dir'], PIPE_STDOUT)
+    git_dir = p.stdout.read().strip()
+    if join_(p) != 0:
+        sys.exit(1)  # rev-parse already printed a suitable error
+    return git_dir
+
+def rev_parse_(rev):
+    p = popen(['git', 'rev-parse', '--verify', rev], PIPE_STDOUT | PIPE_STDERR)
+    output = p.stdout.read()
+    if join_(p) != 0:
+        return None
+    return output.strip()
+
+def rev_parse(rev):
+    return run_output(['git', 'rev-parse', '--verify', rev]).strip()
+
+def pretty_commit(commit):
+    return pr(run_output(['git', 'log', '-1', '--pretty=format:%h (%s)', commit]))
+
+# Returns pairs (refname, SHA-1). This only returns refs that refer to commits.
+def list_refs(extra = []):
+    refs = []
+    lines = run_output(['git', 'for-each-ref',
+                        '--format=%(refname) %(objecttype) %(objectname) ' +
+                        '%(*objecttype) %(*objectname)'] +
+                       extra).split(b'\n')[:-1]
+    for line in lines:
+        words = line.split(b' ')
+        if words[1] == b'tag' and words[3] == b'commit':
+            refs.append((words[0], words[4]))
+        elif words[1] == b'commit':
+            refs.append((words[0], words[2]))
+    return refs
+
+# Return subset of 'commits' formed by removing commits that are reachable from
+# other commits in the list.
+def independent_commits(commits):
+    if len(commits) <= 1:
+        return commits
+    else:
+        out = run_output(['git', 'merge-base', '--independent'] + commits)
+        return out.split(b'\n')[:-1]
+
+def run_merge(config, args):
+    p = popen(args)
+    if join_(p) != 0:
+        interrupt(config, "After you have resolved the merge run 'git filter --continue'.")
+
+# Helper for config_get_* functions below.
+def config_get_(get_flag, key, type):
+    cmd = ['git', 'config']
+    if type is not None:
+        cmd.append(type)
+    cmd += ['-z', get_flag, key]
+    p = popen(cmd, PIPE_STDOUT)
+    out = p.stdout.read()
+    result = join_(p)
+    if result == 0:
+        return out.split(b'\x00')[:-1]
+    if result == 1:
+        return []
+    sys.exit(1)  # 'git config' already printed an appropriate error
+
+def config_get_all(key, type = None):
+    return config_get_('--get-all', key, type)
+
+def config_get_regexp(key, type = None):
+    return config_get_('--get-regexp', key, type)
+
+def config_get(key, default_value, type = None):
+    values = config_get_('--get', key, type)
+    return values[-1] if len(values) > 0 else default_value
+
+def config_get_bool(key, default_value):
+    value = config_get(key, b'true' if default_value else b'false', b'--bool')
+    return True if value == b'true' else False
+
+
+########################################################################
+##  Commit and Tree Processing
+
+class Identity():
+    def __init__(self, raw, name, email, date):
+        self.raw = raw
+        self.name = name
+        self.email = email
+        self.date = date
+
+class CommitInfo():
+    def __init__(self, commit):
+        self.commit = commit
+        self.tree = None
+        self.parents = []
+        self.author = None
+        self.committer = None
+        self.extra_headers = []
+        self.message = None
+
+def parse_identity(raw):
+    name, rest = raw.split(b'<', 1)
+    email, date = rest.rsplit(b'>', 1)
+    return Identity(raw, name.strip(), email.strip(), date.strip())
+
+def read_commit(commit, parse_extra_headers = False):
+    info = CommitInfo(commit)
+    p = popen(['git', 'cat-file', 'commit', commit], PIPE_STDOUT)
+    line = p.stdout.readline()
+    while line != b'\n':
+        key, value = line.split(b' ', 1)
+        value = value[:-1]   # snip '\n'
+        if key == b'tree':
+            info.tree = value
+        elif key == b'parent':
+            info.parents.append(value)
+        elif key == b'author':
+            info.author = parse_identity(value)
+        elif key == b'committer':
+            info.committer = parse_identity(value)
+        elif parse_extra_headers:
+            line = p.stdout.readline()
+            while line[0] == b' ':
+                value += b'\n' + line[1:-1]  # snip space and '\n'
+                line = p.stdout.readline()
+            info.extra_headers.append((key, value))
+            continue
+        line = p.stdout.readline()
+    info.message = p.stdout.read()
+    join(p)
+    return info
+
+# Version of write_commit that tries to preserve all information from the
+# original commit in exactly the same form. Intended mainly for testing.
+def write_commit_raw(info):
+    text = []
+    text.append(b'tree ' + info.tree)
+    for p in info.parents:
+        text.append(b'parent ' + p)
+    text.append(b'author ' + info.author.raw)
+    text.append(b'committer ' + info.committer.raw)
+    for (key, value) in info.extra_headers:
+        text.append(key + b' ' + value.replace(b'\n', b'\n '))
+    text.append(b'')
+    text.append(info.message)
+    p = popen(['git', 'hash-object', '-t', 'commit',
+               '--no-filters', '-w', '--stdin'], PIPE_STDIN | PIPE_STDOUT | PIPE_STDERR)
+    new_commit, unused = p.communicate(b'\n'.join(text))
+    join(p)
+    return new_commit.strip()
+
+def set_identity_vars(env, role, id):
+    if id.name != b'':
+        env['GIT_%s_NAME' % role] = id.name
+    else:
+        env['GIT_%s_NAME' % role] = '"%s"' % id.email
+    env['GIT_%s_EMAIL' % role] = id.email
+    env['GIT_%s_DATE' % role] = b'@' + id.date
+
+def write_commit(info):
+    env = os.environ.copy()
+
+    set_identity_vars(env, 'AUTHOR', info.author)
+    set_identity_vars(env, 'COMMITTER', info.committer)
+
+    cmd = ['git', 'commit-tree', info.tree]
+    for p in info.parents:
+        cmd.append('-p')
+        cmd.append(p)
+    p = popen(cmd, PIPE_STDIN | PIPE_STDOUT, env)
+    commit, unused = p.communicate(info.message)
+    join(p)
+    return commit.strip()
+
+# Trees are represented as lists of (mode, type, content, name) tuples. This is
+# meant to reflect the output of 'git ls-tree'. 'content' may either be an
+# object hash or a nested list of entries, representing a subtree.
+
+def subtree_entry(tree, name):
+    return (b'040000', b'tree', tree, name)
+
+# Maps from tree and commit hashes to tree lists.
+g_tree_cache = {}
+
+def read_tree(tree):
+    if tree is None:
+        return []
+    if type(tree) is list:
+        return tree  # already loaded
+    entries = g_tree_cache.get(tree)
+    if entries:
+        # Copy to ensure caller doesn't mutate the version in the cache.
+        return list(entries)
+    out = run_output(['git', 'ls-tree', '-z', tree]).split(b'\0')[:-1]
+    entries = []
+    for line in out:
+        [info, ent_name] = line.split(b'\t', 1)
+        [ent_mode, ent_type, ent_hash] = info.split(b' ')
+        entries.append((ent_mode, ent_type, ent_hash, ent_name))
+    g_tree_cache[tree] = entries
+    return entries
+
+def write_tree(tree):
+    if type(tree) is not list:
+        return tree  # None or already persisted
+    for i, (ent_mode, ent_type, ent_content, ent_name) in enumerate(tree):
+        if type(ent_content) is list:
+            tree[i] = (ent_mode, ent_type, write_tree(ent_content), ent_name)
+    p = popen(['git', 'mktree', '-z'], PIPE_STDIN | PIPE_STDOUT)
+    for (ent_mode, ent_type, ent_hash, ent_name) in tree:
+        p.stdin.write(ent_mode + b' ' + ent_type + b' ' +
+                      ent_hash + b'\t' + ent_name + b'\0')
+    p.stdin.close()
+    hash = p.stdout.read().strip()
+    join(p)
+    # Copy to ensure cache has its own copy.
+    g_tree_cache[hash] = list(tree)
+    return hash
+
+# Common implementation for [read/write]_tree_entry.
+def walk_tree(root_tree, path, write_entry):
+    writing = write_entry is not None
+    if writing:
+        write_mode, write_type, write_content, write_name = write_entry
+    parts = path.split(b'/')
+    if len(parts[-1]) == 0:
+        # trailing slash
+        parts = parts[:-1]
+    n = len(parts)
+    if n == 0:
+        if writing:
+            if write_type == b'tree':
+                return write_content
+            else:
+                die("can't write non-tree entry at root of tree!")
+        else:
+            return subtree_entry(root_tree, None)
+    root_tree = read_tree(root_tree)
+    tree = root_tree
+    for i in range(n):
+        for j, (ent_mode, ent_type, ent_content, ent_name) in enumerate(tree):
+            if ent_name != parts[i]:
+                continue
+            if i == n - 1:
+                if writing:
+                    tree[j] = (write_mode, write_type, write_content, ent_name)
+                    return root_tree
+                else:
+                    if path[-1] == ord(b'/') and ent_type != b'tree':
+                        return None
+                    return tree[j]
+            if ent_type == b'tree':
+                if type(ent_content) != list:
+                    ent_content = read_tree(ent_content)
+                    tree[j] = (ent_mode, ent_type, ent_content, ent_name)
+                tree = ent_content
+            else:
+                if writing:
+                    next_tree = []
+                    tree[j] = subtree_entry(next_tree, ent_name)
+                    tree = next_tree
+                else:
+                    return None
+            break
+        else:
+            if writing:
+                for j in range(i, n - 1):
+                    next_tree = []
+                    tree.append(subtree_entry(next_tree, parts[j]))
+                    tree = next_tree
+                tree.append((write_mode, write_type, write_content, parts[-1]))
+                return root_tree
+            else:
+                return None
+
+# Read tree entry at given path and return it. Returns None if any component of
+# the path doesn't exist, or if any component except the last one isn't a tree.
+def read_tree_entry(tree, path):
+    return walk_tree(tree, path, None)
+
+# Write tree entry at the given path. Returns the new root tree.
+def write_tree_entry(tree, path, entry):
+    return walk_tree(tree, path, entry)
+
+def trees_equal(a, b):
+    if type(a) is not list and type(b) is not list:
+        # Just compare hashes
+        return a == b
+    a = read_tree(a)
+    b = read_tree(b)
+    if len(a) != len(b):
+        return False
+    for i in range(len(a)):
+        a_mode, a_type, a_content, a_name = a[i]
+        b_mode, b_type, b_content, b_name = b[i]
+        if a_mode != b_mode or a_type != b_type or a_name != b_name:
+            return False
+        if a_type == b'tree':
+            if not trees_equal(a_content, b_content):
+                return False
+        else:
+            if a_content != b_content:
+                return False
+    return True
+
+
+########################################################################
+##  Configuration and Reachability
+
+# The reachability cache answers queries of the form "Is T reachable from C",
+# where C is any commit and T is one of a small number of target commits. Adding
+# a new target commit is expensive but once added determining the reachability
+# of the target commit from any other commit is generally fast.
+class ReachabilityCache:
+
+    def __init__(self):
+        # Mapping from pairs (K, T) to boolean r, where K is a key commit, T is
+        # a target commit and r is True if T is reachable from K and False if T
+        # is not reachable from K.
+        self.map = {}
+
+        # Has the cache been modified since it was loaded?
+        self.dirty = False
+
+    def load(self, file, cache):
+        map = cache.get('REACHABILITY_MAP')
+        if type(map) is not dict:
+            warn("%s: Reachability map missing or incorrect type" % pr(file))
+            self.map = {}
+        else:
+            self.map = map
+        self.dirty = False
+
+    def save(self, cache):
+        cache['REACHABILITY_MAP'] = self.map
+
+    def _is_key_commit(self, commit):
+        # Make roughly 1 out of 256 commits key commits.
+        return commit[0] == 0xff
+
+    # Helper for populate() - mark all key commits output by the given
+    # git-revlist command as either can-reach or can-not-reach the given target.
+    def _mark_key_commits(self, revlist_cmd, target, reachable):
+        revlist = popen(revlist_cmd, PIPE_STDOUT)
+        while True:
+            commit = revlist.stdout.readline().strip()
+            if len(commit) == 0:
+                break
+            commit = unhexlify(commit)
+            if self._is_key_commit(commit):
+                self.map[(commit, target)] = reachable
+        join(revlist)
+
+    # Populate the cache with reachability information for target. If tip is
+    # given, only populate the cache for commits reachable from tip; otherwise,
+    # populate for all commits.
+    def populate(self, target, tip = None):
+        say("Populating reachability cache for '%s'" % pr_hex(target))
+        trace_enter()
+
+        # First pass - mark all commits as can't-reach-target
+        revlist_cmd = ['git', 'rev-list', hexlify(tip) if tip else '--all']
+        self._mark_key_commits(revlist_cmd, target, False)
+
+        # Second pass - mark all descendents of target as can-reach-target
+        revlist_cmd.extend(['--ancestry-path', '--not', hexlify(target)])
+        self._mark_key_commits(revlist_cmd, target, True)
+
+        self.dirty = True
+        trace_exit()
+
+    # Helper for _query_reachability.
+    # Returns True normally, False if this was a recursive call and the
+    # recursion depth limit was exceeded.
+    def _query_reachability_inner(self, tip, targets, exclude, reachable_set,
+                                  recursion_depth):
+
+        KEY_COMMITS_PER_ITERATION = 8
+        MAX_RECURSION_DEPTH = 5
+
+        # When we discover a target is reachable we remove it from "targets".
+        def mark_target_reachable(target):
+            reachable_set.add(hexlify(target))
+            targets.discard(target)
+
+        revlist_cmd = ['git', 'rev-list', hexlify(tip)]
+        if exclude:
+            revlist_cmd.extend(['--not'] + [hexlify(e) for e in exclude])
+        revlist = popen(revlist_cmd, PIPE_STDOUT)
+
+        def terminate_revlist():
+            revlist.terminate()
+            join_(revlist)
+
+        commits     = []
+        key_commits = []
+
+        while len(key_commits) < KEY_COMMITS_PER_ITERATION:
+            commit = revlist.stdout.readline().strip()
+
+            if len(commit) == 0:
+                # We have a small enough commit list to search directly. If we
+                # don't find a target we know that target is unreachable.
+                for commit in commits:
+                    if commit in targets:
+                        mark_target_reachable(commit)
+                targets.clear()
+                join(revlist)
+                return True
+
+            commit = unhexlify(commit)
+
+            # Add to list in case we need to go into the direct-search case later.
+            commits.append(commit)
+
+            # We don't deal with non-key commits unless we hit the "direct
+            # search" case above.
+            if not self._is_key_commit(commit):
+                continue
+
+            key_commits.append(commit)
+
+            # Test reachability of all targets from this key commit. If any
+            # target is reachable from the key commit it means that target is
+            # also reachable from 'tip'.
+            missing = []
+            # (iterate over copy of 'targets' since we mutate 'targets')
+            for target in set(targets):
+                reachable = (commit == target or self.map.get((commit, target)))
+                if reachable is None:
+                    # No reachability information for this key commit. We will
+                    # recurse to fill it in, unless we're already at our
+                    # recursion limit, in which case we'll fall back on
+                    # populate() after unwinding the recursive calls.
+                    if recursion_depth >= MAX_RECURSION_DEPTH:
+                        terminate_revlist()
+                        return False
+                    else:
+                        missing.append(target)
+                elif reachable:
+                    mark_target_reachable(target)
+
+            # If we are missing information for one or more targets, we'll
+            # recurse to fill it in - unless the current call is itself a
+            # recursive call that was made to fill in the information for this
+            # key commit, in which case it will be filled in when we return.
+            if len(missing) > 0 and (recursion_depth == 0 or commit != tip):
+                # NOTE: We copy 'missing' into a new set here because
+                # _query_reachability will mutate the passed-in set.
+                missing_reachable = self._query_reachability(commit, set(missing),
+                                                             recursion_depth + 1)
+                if missing_reachable is None:
+                    # We hit the recursion limit while in the recursive call.
+                    # Keep unwinding until we reach the outer call, then
+                    # populate().
+                    if recursion_depth > 0:
+                        terminate_revlist()
+                        return False
+                    for target in missing:
+                        self.populate(target)
+                        if self.map[(commit, target)]:
+                            mark_target_reachable(target)
+                else:
+                    # Recursive call succeeded - we now have exact reachability
+                    # information for this key commit.
+                    for target in missing:
+                        reachable = (target in missing_reachable)
+                        self.map[(commit, target)] = reachable
+                        if reachable:
+                            mark_target_reachable(target)
+                    self.dirty = True
+
+            # May be done now.
+            if len(targets) == 0:
+                break
+
+        # If we got here we didn't read all the output from 'git rev-list', so
+        # we'll explicitly terminate it.
+        terminate_revlist()
+
+        # If we still have work to do, exclude commits reachable from key
+        # commits we saw above on subsequent iterations.
+        if len(targets) > 0:
+            trace("repeat (saw %d commits)" % len(commits))
+            exclude.extend(key_commits)
+
+        return True
+
+    def _query_reachability(self, tip, targets, recursion_depth):
+        trace_enter("_query_reachability(%s)" % pr(hexlify(tip)))
+        reachable = set()
+        exclude   = []
+        while len(targets) > 0:
+            if not self._query_reachability_inner(tip, targets, exclude,
+                                                  reachable, recursion_depth):
+                trace_exit()
+                return None
+        trace_exit()
+        return reachable
+
+    # Returns set containing subset of 'targets' that are reachable from 'tip'.
+    def query(self, tip, targets):
+        targets = set([unhexlify(t) for t in targets])
+        return self._query_reachability(unhexlify(tip), targets, 0)
+
+class Profile:
+    def __init__(self, name):
+        self.name = name
+
+        # List of roots for this profile (Root objects)
+        self.roots = []
+
+        # List of tip commits (starting points for searching for images) that
+        # can reach commits of this profile.
+        self.tips = []
+
+        # Filters with this profile as a source (indexed by target profile)
+        self.filters = {}
+
+        # Indexed by commit hash
+        self.image_cache = {}
+
+    def get_root(self, name):
+        return next((root for root in self.roots if root.name == name), None)
+
+    def next_default_root_name(self):
+        max_index = -1
+        for root in self.roots:
+            if root.name[0:4] == b'root':
+                try:
+                    index = int(root.name[4:])
+                except ValueError:
+                    continue
+                if max_index < index:
+                    max_index = index
+        return b'root%d' % (max_index + 1)
+
+class Root:
+    def __init__(self, commit, profile, name):
+        self.commit = commit
+        self.profile = profile
+        self.name = name
+
+    def ref_name(self):
+        return b'refs/profiles/' + self.profile.name + b'/' + self.name
+
+    def update_ref(self, flags = []):
+        run(['git', 'update-ref'] + flags + [self.ref_name(), self.commit])
+
+    def rename(self, name):
+        self.update_ref(['-d'])
+        self.name = name
+        self.update_ref()
+
+class Filter:
+    def __init__(self, source_profile, target_profile):
+        self.source_profile = source_profile
+        self.target_profile = target_profile
+        self.path_map = []  # list of (src, dst) pairs
+
+        # Pathspec to identify commits on the source side that are of interest
+        # to the filter.
+        self.pathspec = None
+
+        # Pathspec to find commits that modify the context on the target side of
+        # the filter.
+        self.context_pathspec = None
+
+    def finish(self):
+        # Does the filter need a context commit from the target side in order to
+        # generate images? We need context unless the filter replaces the entire
+        # tree on the target side.
+        needs_context = True
+        for (lhs, rhs) in self.path_map:
+            if len(rhs) == 0:
+                needs_context = False
+                break
+        self.pathspec = [(b':(top)' + lhs) for (lhs, rhs) in self.path_map]
+        if needs_context:
+            self.context_pathspec = [b':/'] + [(b':(top,exclude)' + rhs)
+                                              for (lhs, rhs) in self.path_map]
+
+    # Return reverse filter.
+    def reverse(self):
+        filter = Filter(self.target_profile, self.source_profile)
+        for (src, dst) in self.path_map:
+            filter.path_map.append((dst, src))
+        filter.finish()
+        return filter
+
+def parse_path_mapping(filter_id, rule):
+    slash = ord(b'/')
+
+    def invalid(why):
+        die("filter '%s' has invalid path mapping (%s): '%s'"
+                % (pr(filter_id), why, pr(rule)))
+
+    def parse_path(path, role):
+        if len(path) == 0:
+            return path
+        if path[0] == slash:
+            invalid("%s starts with '/'" % role)
+        has_trailing_slash = (path[-1] == slash)
+        # collapse duplicate '/'s:
+        path = b'/'.join(filter(None, path.split(b'/')))
+        if has_trailing_slash:
+            path += b'/'
+        return path
+
+    def matches_only_directories(path):
+        return len(path) == 0 or path[-1] == slash
+
+    try:
+        parts = separate_strings(rule, b':')
+    except ValueError as e:
+        invalid(str(e))
+    if len(parts) == 1:
+        lhs = parse_path(parts[0], "path")
+        rhs = lhs
+    elif len(parts) == 2:
+        lhs = parse_path(parts[0], "left side")
+        rhs = parse_path(parts[1], "right side")
+        if matches_only_directories(lhs) != matches_only_directories(rhs):
+            if matches_only_directories(rhs):
+                invalid("left side missing trailing '/'")
+            else:
+                invalid("right side missing trailing '/'")
+    else:
+        invalid("too many unescaped ':'s")
+    return (lhs, rhs)
+
+# Configuration and cached data.
+class Config:
+    CACHE_MAGIC = "git-filter.cache"
+
+    def cache_file(self):
+        return git_dir + b'/git-filter.cache'
+
+    def __init__(self):
+        self.reachability_cache = ReachabilityCache()
+
+        # Collection of Profile objects, indexed by name.
+        self.profiles = {}
+
+        # Collection of Root objects, indexed by commit hash.
+        self.roots = {}
+
+        # Relationships between roots.
+        # Maps (R1, R2) -> r, where r is True if root R2 is reachable from R1
+        # (i.e. R1 "covers" R2), False if R2 is not reachable from R1. (Here R1
+        # and R2 are hashes, not Root objects.)
+        self.root_covers = {}
+
+        # Set of tip commits (starting points for image searches). This set can
+        # include redundant tips (tips reachable from other tips).
+        self.all_tips = set()
+
+        # Maps C -> R, where C is a tip and R is the set of roots (hashes)
+        # reachable from C. Unlike 'all_tips', this map only includes tips that
+        # are not reachable from other tips.
+        self.tip_to_roots = {}
+
+        # Was cached information modified since it was loaded?
+        self.cache_dirty = False
+
+    def get_profile(self, name):
+        profile = self.profiles.get(name)
+        if profile is None:
+            profile = Profile(name)
+            self.profiles[name] = profile
+        return profile
+
+    def add_root(self, root):
+        root.profile.roots.append(root)
+        self.roots[root.commit] = root
+
+    def remove_root(self, root):
+        root.update_ref(['-d'])
+        root.profile.roots.remove(root)
+        del self.roots[root.commit]
+
+    def load_profiles(self):
+        for ref, commit in list_refs(['refs/profiles']):
+            parts = ref.split(b'/', 3)[2:]
+            if len(parts) != 2:
+                continue
+            profile = self.get_profile(parts[0])
+            existing_root = self.roots.get(commit)
+            if existing_root is not None:
+                die(("'%s' is recorded as a root of multiple profiles " +
+                     "(including '%s' and '%s')") %
+                     (pr(commit), pr(profile.name), pr(existing_root.profile.name)))
+            self.add_root(Root(commit, profile, parts[1]))
+
+    def load_filter(self, id):
+        parts = id.split(b':')
+        if len(parts) != 2:
+            die("Invalid filter ID '" + pr(id) + "' (should have form '<source>:<target>').")
+
+        source = self.get_profile(parts[0])
+        target = self.get_profile(parts[1])
+        filter = Filter(source, target)
+
+        key = b'filter.' + id
+        for rule in config_get_all(key + b'.pathMap'):
+            filter.path_map.append(parse_path_mapping(id, rule))
+
+        if len(filter.path_map) == 0:
+            filter.path_map.append((b'', b''))
+
+        filter.finish()
+        return filter
+
+    def load_filters(self):
+        loaded_filters = set()
+        for setting in config_get_regexp(b'filter.*'):
+            parts = setting[7:].rsplit(b'.', 1)
+            if len(parts) == 2 and parts[0] not in loaded_filters:
+                filter = self.load_filter(parts[0])
+                filter.source_profile.filters[filter.target_profile] = filter
+                filter.target_profile.filters[filter.source_profile] = filter.reverse()
+                loaded_filters.add(parts[0])
+
+    def _load_cache(self, file):
+        try:
+            data = pickle.load(gzip.open(file, "rb"))
+        except Exception as e:
+            return str(e)
+        if type(data) is not dict or data.get('MAGIC') != self.CACHE_MAGIC:
+            return "Not a valid cache file"
+        if data.get('VERSION') != 1:
+            return "Unrecognized cache file version"
+
+        roots        = data.get('ROOTS')
+        root_covers  = data.get('ROOT_COVERS')
+        all_tips     = data.get('ALL_TIPS')
+        tip_to_roots = data.get('TIP_TO_ROOTS')
+
+        if type(roots) is not list:
+            warn("%s: Missing roots list" % pr(file))
+            roots = None
+
+        if type(root_covers) is not dict:
+            warn("%s: Missing root coverage map" % pr(file))
+            root_covers = {}
+
+        if type(all_tips) is not set:
+            warn("%s: Missing all-tips set" % pr(file))
+            all_tips = set()
+
+        if type(tip_to_roots) is not dict:
+            warn("%s: Missing tips-to-roots map" % pr(file))
+            tip_to_roots = {}
+
+        # If the set of roots changed, regenerate the tips-to-roots mappings
+        # since information about any new roots won't be recorded there.
+        # NOTE: This is the only thing we persist 'roots' for; it is stored only
+        # to record "the set of roots that 'tip_to_roots' was generated for".
+        if roots != sorted(list(self.roots)):
+            for tip in tip_to_roots:
+                tip_to_roots[tip] = None
+
+        self.root_covers  = root_covers
+        self.all_tips     = all_tips
+        self.tip_to_roots = tip_to_roots
+
+        self.reachability_cache.load(file, data)
+
+    def load_cache(self):
+        file = self.cache_file()
+        if not os.path.isfile(file):
+            return
+        error = self._load_cache(file)
+        if error is not None:
+            warn("%s: %s" % (pr(file), error))
+
+    # Ensure root coverage information is complete for all roots, and remove any
+    # coverage information for commits that are no longer roots.
+    def compute_root_coverage(self):
+        root_covers = {}
+
+        # Loop over all pairs of roots and determine if we have coverage
+        # information for them already. Build a per-root list of missing
+        # coverage information for the second pass.
+        for root in self.roots.values():
+            root.check_if_covers = []
+        for root in self.roots.values():
+            for other in self.roots:
+                if other is root.commit:
+                    continue
+                covers = self.root_covers.get((root.commit, other))
+                if covers is None:
+                    root.check_if_covers.append(other)
+                else:
+                    root_covers[(root.commit, other)] = covers
+
+        # Query any missing coverage information.
+        for root in self.roots.values():
+            if len(root.check_if_covers) > 0:
+                reachable = self.reachability_cache.query(root.commit,
+                                                          root.check_if_covers)
+                for other in root.check_if_covers:
+                    root_covers[(root.commit, other)] = (other in reachable)
+            del root.check_if_covers
+
+        # Mark cache dirty if anything changed.
+        if self.root_covers != root_covers:
+            self.root_covers = root_covers
+            self.cache_dirty = True
+
+    # Load tips and update root-reachability information for tips.
+    def load_tips(self):
+        tip_to_roots = {}
+
+        # All commits pointed to by refs are taken as tips.
+        all_tips = set([commit for ref, commit in list_refs()])
+
+        if all_tips == self.all_tips:
+            independent_tips = list(self.tip_to_roots)
+        else:
+            # We already know the independent set for self.all_tips (the keys of
+            # self.tip_to_roots), so just add on the new tips to that set for
+            # this query.
+            commits = (all_tips - self.all_tips) | set(self.tip_to_roots)
+            independent_tips = independent_commits(list(commits))
+
+        for tip in independent_tips:
+            roots = self.tip_to_roots.get(tip)
+            if roots is None:
+                roots = self.reachability_cache.query(tip, list(self.roots))
+            tip_to_roots[tip] = roots
+            for root_commit in roots:
+                self.roots[root_commit].profile.tips.append(tip)
+
+        # Mark cache dirty if anything changed.
+        if self.tip_to_roots != tip_to_roots or self.all_tips != all_tips:
+            self.all_tips     = all_tips
+            self.tip_to_roots = tip_to_roots
+            self.cache_dirty  = True
+
+    def is_cache_dirty(self):
+        return self.cache_dirty or self.reachability_cache.dirty
+
+    def _save_cache(self, file):
+        data = { 'MAGIC':           self.CACHE_MAGIC,
+                 'VERSION':         1,
+                 'ROOTS':           sorted(list(self.roots)),
+                 'ROOT_COVERS':     self.root_covers,
+                 'ALL_TIPS':        self.all_tips,
+                 'TIP_TO_ROOTS':    self.tip_to_roots }
+        self.reachability_cache.save(data)
+        try:
+            pickle.dump(data, gzip.open(file + b".tmp", "wb"))
+            os.rename(file + b".tmp", file)
+        except Exception as e:
+            return str(e)
+
+    def save_cache_if_dirty(self):
+        if self.is_cache_dirty():
+            file = self.cache_file()
+            error = self._save_cache(file)
+            if error is not None:
+                warn("Can't save cache file '%s': %s" % (pr(file), error))
+
+# Returns list of roots reachable from 'commit' (and not covered by other roots
+# reachable from 'commit'). If 'exclude_commit' is True and 'commit' is a root,
+# pretend it isn't (otherwise in this case we will return a single root -
+# 'commit' itself).
+def get_reachable_roots(config, commit, candidates = None, exclude_commit = False):
+    if candidates is None:
+        candidates = list(config.roots)
+    else:
+        candidates = list(candidates)
+    if exclude_commit and commit in candidates:
+        candidates.remove(commit)
+    root_commits = config.reachability_cache.query(commit, candidates)
+    roots = [config.roots[r] for r in root_commits]
+    uncovered_roots = []
+    for root in roots:
+        for other in roots:
+            if (other is not root and
+                config.root_covers[(other.commit, root.commit)]):
+                break
+        else:
+            uncovered_roots.append(root)
+    return uncovered_roots
+
+# Return set of profiles that have roots reachable from 'commit'.
+def get_reachable_profiles(config, commit, candidate_roots = None,
+                           exclude_commit = False):
+    return set([root.profile for root in
+                get_reachable_roots(config, commit, candidate_roots,
+                                    exclude_commit)])
+
+def check_for_profile_ambiguities(config):
+    # We want to find commits with ambiguous profiles. Specifically, we want to
+    # find the commits that *introduce* the ambiguities so we can tell the user
+    # how to fix them.
+    revlist_cmd = ['git', 'rev-list', '--all', '--reverse',
+                   '--simplify-by-decoration', '--topo-order']
+    revlist = popen(revlist_cmd, PIPE_STDOUT)
+    while True:
+        commit = revlist.stdout.readline().strip()
+        if len(commit) == 0:
+            break
+        profiles = get_reachable_profiles(config, commit)
+        if len(profiles) > 1:
+            config.save_cache_if_dirty()
+            die("""\
+Profile of '%s' is ambiguous
+Possible profiles: %s
+Set this commit to the desired profile with '--set-profile' to resolve."""
+                % (pretty_commit(commit), ", ".join([pr(p.name) for p in profiles])))
+    join(revlist)
+
+# Get profile of specified commit. Used in contexts where an ambiguous profile
+# is a fatal error.
+def profile_of(config, commit, reachable_roots = None):
+    if reachable_roots is None:
+        reachable_roots = get_reachable_roots(config, commit)
+    profiles = set([root.profile for root in reachable_roots])
+    if len(profiles) == 0:
+        die("""\
+No profile applies to commit '%s'.
+Set up profiles on root commits with 'git filter --set-profile'.
+""" % pretty_commit(commit))
+    elif len(profiles) > 1:
+        die("""
+Profile of '%s' is ambiguous, cannot continue.
+Use 'git filter --check' to find sources of ambiguities.
+""" % pretty_commit(commit))
+    else:
+        return profiles.pop()
+
+# If any roots of the given profile are unnecessary, remove them.
+def remove_redundant_roots(config, profile):
+    redundant_roots = []
+    for root in profile.roots:
+        profiles = get_reachable_profiles(config, root.commit, None, True)
+        if len(profiles) == 1 and profiles.pop() is profile:
+            redundant_roots.append(root)
+    for root in redundant_roots:
+        config.remove_root(root)
+
+
+########################################################################
+##  Filtering
+
+# Search for the image of the specified commit for the specified profile.
+def find_image(config, commit, target_profile):
+    # Trival case - if there are no tips that can reach commits of the target
+    # profile then we'll never find images of that profile.
+    if len(target_profile.tips) == 0:
+        return None
+
+    trace_enter("find_image(%s, %s)" % (pr(commit), pr(target_profile.name)))
+
+    info = read_commit(commit)
+
+    # Set of roots that may be reachable from commits with 'target_profile'.
+    # We limit the search to these roots to speed things up, since reachability
+    # queries are significantly slower if a target is not reachable.
+    candidate_roots = set()
+    for commit in target_profile.tips:
+        candidate_roots.update(config.tip_to_roots[commit])
+
+    # Images always have the same commit date as the original commit.
+    revlist_cmd = ['git', 'rev-list', '--since', info.committer.date,
+                   '--until', info.committer.date] + target_profile.tips
+
+    # If there's more than one image it's an error, but we'll accumulate them
+    # all so we can list them in the error message.
+    images = []
+
+    revlist = popen(revlist_cmd, PIPE_STDOUT)
+    while True:
+        candidate = revlist.stdout.readline().strip()
+        if len(candidate) == 0:
+            break
+        candidate_info = read_commit(candidate)
+
+        # Currently commit message has to match.
+        if candidate_info.message != info.message:
+            continue
+
+        reachable_roots = get_reachable_roots(config, candidate,
+                                              candidate_roots)
+        if profile_of(config, candidate, reachable_roots) is not target_profile:
+            continue
+
+        images.append(candidate)
+    join(revlist)
+
+    trace_exit()
+
+    if len(images) > 1:
+        error = ("multiple possible images found for '%s' with profile '%s':\n\t" %
+                 (pretty_commit(commit), target_profile.name))
+        die(error + "\n\t".join([pretty_commit(c) for c in images]))
+    elif len(images) > 0:
+        return images[0]
+    else:
+        return None
+
+def image_of(config, commit, profile):
+    image = profile.image_cache.get(commit, False)
+    if image is False or image is True:
+        image = find_image(config, commit, profile)
+        profile.image_cache[commit] = image
+    return image
+
+def has_image(config, commit, profile):
+    image = profile.image_cache.get(commit, False)
+    if image is False:
+        image = find_image(config, commit, profile)
+        profile.image_cache[commit] = image
+    return image is not None
+
+# Walk the first-parent chain from 'tip' looking for a boundary commit. Stop
+# walking when we reach a commit we've already visited.
+#    The list of walked commits is returned, along with the index of the
+# boundary commit (the first commit with an image) in that list.
+def walk_first_parent_chain(config, filter, tip, visited, visited_inside):
+    revlist_cmd = (['git', 'rev-list', '--first-parent', '--parents',
+                    '--full-history', tip, '--'] + filter.pathspec)
+    revs = []
+
+    # Read revisions from 'git rev-list', adding them to our local 'revs' list.
+    # Stop if we hit a revision that has already been visited (indicates that it
+    # was part of an "outer" first-parent chain).
+    revlist = popen(revlist_cmd, PIPE_STDOUT)
+    while True:
+        line = revlist.stdout.readline()
+        if len(line) == 0:
+            # Reached an orphan commit
+            join(revlist)
+            if len(revs) == 0:
+                return ([], 0)
+            root = config.roots.get(revs[-1][0])
+            if root is None:
+                die("""\
+No profile set for root commit '%s'.
+Set a profile with 'git filter --set-profile'.
+""" % pretty_commit(commit))
+            if root.profile is not filter.source_profile:
+                die("'%s' has unexpected profile '%s' (should be '%s')" %
+                    (pretty_commit(commit), pr(root.profile.name),
+                     pr(filter.source_profile.name)))
+            break
+
+        words = line.strip().split(b' ')
+        commit = words[0]
+
+        if commit in visited:
+            # Reached a commit we already visited (part of an "outer"
+            # first-parent chain)
+            revlist.terminate()
+            join_(revlist)
+            if len(revs) == 0:
+                return ([], 0)
+            if commit in visited_inside:
+                # Commit is inside the boundary, which means this entire
+                # chain must be inside the boundary as well.
+                trace("Entire chain within boundary")
+                return (revs, len(revs))
+            break
+
+        revs.append((words[0], words[1:]))
+
+    trace("Search %d commits" % len(revs))
+
+    # Check the case where the entire chain has images first, since it's common
+    # and indicates we likely don't have much work to do overall, so it should
+    # be fast.
+    if has_image(config, revs[0][0], filter.target_profile):
+        return (revs, 0)
+
+    # Binary search
+    # At each stage, we know that the first commit without an image
+    # (if there is one) is in [lo, hi).
+    lo, hi = 0, len(revs)
+    while hi - lo > 1:
+        mid = ((hi - lo) // 2) + lo
+        if has_image(config, revs[mid][0], filter.target_profile):
+            hi = mid
+        else:
+            lo = mid
+
+    return (revs, lo + 1)
+
+def find_boundary_recursive(config, filter, tip, boundary, visited, visited_inside):
+    trace_enter("find_boundary_recursive('" + pr(tip) + "')")
+
+    # Walk the first-parent chain from tip and find the boundary commit on that
+    # chain as well as the subset of the chain within the boundary.
+    commits, bi = walk_first_parent_chain(config, filter, tip, visited,
+                                          visited_inside)
+    visited.update([commit for (commit, parents) in commits])
+    if bi < len(commits):
+        b = commits[bi][0]
+        trace("found boundary commit: %s (%d) " %(pr(b), bi))
+        boundary.append(b)
+        commits_inside = commits[:bi]
+    else:
+        commits_inside = commits
+    visited_inside.update([commit for (commit, parents) in commits_inside])
+
+    # Populate image cache for commits on the first-parent chain.
+    for (commit, parents) in commits[bi:]:
+        if filter.target_profile.image_cache.get(commit, False) is False:
+            filter.target_profile.image_cache[commit] = True
+    for (commit, parents) in commits_inside:
+        filter.target_profile.image_cache[commit] = None
+
+    # Search any side chains.
+    for (commit, parents) in reversed(commits_inside):
+        for parent in parents[1:]:
+            find_boundary_recursive(config, filter, parent, boundary,
+                                    visited, visited_inside)
+
+    trace_exit()
+
+# This function finds and returns the boundary commits reachable from 'tip'. A
+# boundary commit is a commit that has a different profile or that has an image
+# already, and which is not reachable from any other commits with these
+# properties. 
+def find_boundary(config, filter, tip):
+    boundary       = []
+    visited        = set()
+    visited_inside = set()
+
+    find_boundary_recursive(config, filter, tip, boundary,
+                            visited, visited_inside)
+
+    # Disregard any commits in the 'boundary' list that are reachable from other
+    # commits in the list and therefore are not actually on the boundary.
+    return independent_commits(boundary)
+
+# Generate a new tree by integrating 'tree' into 'context_tree' using the path
+# mappings provided in 'path_map'. Write the new tree to the object database
+# and return its hash.
+def filter_tree(tree, context_tree, path_map):
+    if context_tree is None:
+        filtered_tree = []
+    else:
+        filtered_tree = read_tree(context_tree)
+    for src, dst in path_map:
+        entry = read_tree_entry(tree, src)
+        filtered_tree = write_tree_entry(filtered_tree, dst, entry)
+    return read_tree(filtered_tree)
+
+# Given a tree, extract the parts of it that would be used as context according
+# to 'path_map' and return as a new tree. The new tree is not written into the
+# object database.
+def extract_context(tree, path_map):
+    tree = read_tree(tree)
+    for src, dst in path_map:
+        tree = write_tree_entry(tree, dst, subtree_entry(b'', b''))
+    return tree
+
+# Given that we are applying the specified filter to 'commit', and have already
+# chosen the specified 'filtered_parents' to be the parents of the resulting
+# filtered commit, choose the commit to be used as the basis for the resulting
+# filtered commit.
+def choose_context(config, commit, filter, image_parents):
+    global continuing
+
+    if len(image_parents) == 0:
+        return None
+
+    if len(image_parents) == 1:
+        return image_parents[0]
+
+    # Detect fast case where the context part of all parent's trees is the same.
+    context_tree = extract_context(image_parents[0], filter.path_map)
+    for p in image_parents[1:]:
+        p_context_tree = extract_context(p, filter.path_map)
+        if not trees_equal(context_tree, p_context_tree):
+            break
+    else:
+        return image_parents[0]
+
+    # For each parent on the other side of the filter, walk back and find the
+    # nearest commit that modified the context.
+    candidates = []
+    for p in image_parents:
+        cmd = ['git', 'rev-list', '--topo-order', '--simplify-merges',
+               '--max-count=1', p, '--'] + filter.context_pathspec
+        context = run_output(cmd).strip()
+        if len(context) > 0 and context not in candidates:
+            candidates.append(context)
+    if len(candidates) == 0:
+        return None
+    elif len(candidates) == 1:
+        return candidates[0]
+
+    # Remove candidates that are ancestors of other candidates.
+    candidates = independent_commits(candidates)
+    if len(candidates) == 1:
+        return candidates[0]
+
+    # Modify candidates to make them suitable to merge. Integrate 'commit' into
+    # each candidate as if that candidate by itself was used, so that only the
+    # conflicts between candidates will be in the parts of the tree used for
+    # context.
+    commit_tree = read_tree(commit)
+    for i in range(len(candidates)):
+        info = read_commit(candidates[i])
+        info.tree = write_tree(filter_tree(commit_tree, info.tree, filter.path_map))
+        info.message = b"git-filter temporary commit from " + candidates[i]
+        candidates[i] = write_commit(info)
+
+    i = 0
+    if continuing:
+        # skip to first unmerged candidate
+        while i < len(candidates):
+            if run_test(['git', 'merge-base', '--is-ancestor',
+                         candidates[i], 'HEAD']) != 0:
+                break
+            i += 1
+
+    if i == 0:
+        print("Merging to create context for " + pretty_commit(commit))
+        run(['git', 'reset', '-q', '--hard'])
+        run(['git', 'checkout', '-q', '--detach', candidates[0]])
+        i += 1
+    elif i < len(candidates):
+        print("Continuing merge to create context for " + pretty_commit(commit))
+
+    for candidate in candidates[i:]:
+        msg = """\
+Temporary merge to create context for %s
+
+This is a temporary merge that serves to generate the context needed to filter
+the above commit. It will not appear in the final commit history.
+""" % pretty_commit(commit)
+        run_merge(config, ['git', 'merge', '-q', '-m', msg, candidate])
+
+    continuing = False
+    return run_output(['git', 'rev-parse', '--verify', 'HEAD']).strip()
+
+# Top-level commit-filtering function. Filter commits reachable from 'tip' to
+# the specified target profile. Returns the image corresponding to 'tip' or the
+# closest commit reachable from 'tip' that has an image.
+def filter_commits(config, tip, target_profile):
+
+    # Get roots reachable from 'tip'.
+    roots = get_reachable_roots(config, tip)
+    tip_profile = profile_of(config, tip, roots)
+
+    # Determine filter to use.
+    filter = tip_profile.filters.get(target_profile)
+    if filter is None:
+        die("No filter defined mapping profile '%s' to profile '%s'." %
+            (pr(tip_profile.name), pr(target_profile.name)))
+
+    # Find the set of boundary commits.
+    boundary = find_boundary(config, filter, tip)
+
+    # The only reason a commit without an image is on the boundary is if it is
+    # of a different profile. Filter these separately with a recursive call.
+    for b in boundary:
+        if not has_image(config, b, target_profile):
+            filter_commits(config, b, target_profile)
+
+    # Command to generate the full list of commits to filter.
+    revlist_cmd = ['git', 'rev-list', '--parents', '--topo-order',
+                   '--simplify-merges', '--reverse', tip,
+                   '--not'] + boundary + ['--'] + filter.pathspec
+    revlist = popen(revlist_cmd, PIPE_STDOUT)
+
+    image = None
+
+    while True:
+        line = revlist.stdout.readline()
+        if len(line) == 0:
+            break
+        words = line.strip().split(b' ')
+
+        commit = words[0]
+        parents = words[1:]
+
+        image_parents = []
+        for parent in parents:
+            image = image_of(config, parent, target_profile)
+            if image is None:
+                die("cannot find image of %s, parent of %s" %
+                        (pretty_commit(parent), pretty_commit(commit)))
+
+            # If multiple parents have the same image, only add it once.
+            if image not in image_parents:
+                image_parents.append(image)
+
+        # If we need to context to build the image commit, choose the commit
+        # on the target side of the filter to use for context.
+        context = None
+        if filter.context_pathspec is not None:
+            context = choose_context(config, commit, filter, image_parents)
+
+        # Read source commit
+        info = read_commit(commit, PRESERVE_ALL_METADATA)
+
+        # Generate tree for image
+        tree = filter_tree(info.tree, context, filter.path_map)
+
+        # Generate and record the image commit.
+        info.tree = write_tree(tree)
+        info.parents = image_parents
+        if PRESERVE_ALL_METADATA:
+            image = write_commit_raw(info)
+        else:
+            image = write_commit(info)
+
+        # We frequently index tree cache by commit hash, so add a mapping for
+        # the image commit.
+        g_tree_cache[image] = tree
+
+        # Add to image cache immediately so we don't need to search later.
+        target_profile.image_cache[commit] = image
+
+    join(revlist)
+
+    if image is None:
+        # We didn't filter anything. Return the image corresponding to 'tip' (or
+        # more specifically the first commit reachable from 'tip' that the
+        # filter applies to).
+        first = run_output(['git', 'rev-list', '--max-count=1', tip] + ['--'] +
+                            filter.pathspec).strip()
+        if len(first) == 0:
+            image = None
+        else:
+            image = image_of(config, first, target_profile)
+
+    return image
+
+
+########################################################################
+##  Command and Top-Level Functions
+
+# Helper for argument parsing
+def next_arg(i, args, at_end_error = "out of arguments"):
+    if i < len(args):
+        return (i + 1, args[i])
+    else:
+        die(at_end_error)
+
+# The main filter command
+def cmd_filter(config, args):
+    profile = None
+    tip     = None
+
+    i = 0
+    while i < len(args):
+        i, arg = next_arg(i, args)
+        if arg == b'-p':
+            i, profile = next_arg(i, args, "You must specify a profile name after '-p'")
+            continue
+        if arg[0] == ord(b'-'):
+            die("Unknown flag '" + pr(arg) + "'")
+        if tip:
+            die("Too many arguments to 'git-filter'")
+        tip = arg
+
+    if tip is None:
+        if continuing:
+            tip = b'FILTER_ORIG_HEAD'
+        else:
+            tip = b'HEAD'
+    tip = rev_parse(tip)
+
+    if profile is None:
+        die("You must specify a profile.")
+    profile = config.get_profile(profile)
+
+    image = filter_commits(config, tip, profile)
+    sys.stdout.buffer.write(image + b'\n')
+
+# '--check'
+def cmd_check(config, args):
+    if len(args):
+        die("Too many arguments to '--check'")
+    say("Checking for commits with ambiguous profiles...");
+    check_for_profile_ambiguities(config)
+    say("No ambiguous commits found.")
+
+# '--profile-graph'
+def cmd_profile_graph(config, args):
+    refs = [ref for (ref, commit) in list_refs(['refs/profiles'])]
+    run(['git', 'log', '--graph', '--oneline', '--decorate',
+         '--simplify-by-cmdline'] + refs + args)
+
+# '--profile-of'
+def cmd_profile_of(config, args):
+    if len(args) != 1:
+        die("Wrong number of arguments to '--profile-of'")
+    commit = rev_parse(args[0])
+    profiles = get_reachable_profiles(config, commit)
+    config.save_cache_if_dirty()
+    if len(profiles) == 0:
+        say("No profile.")
+        sys.exit(1)
+    elif len(profiles) == 1:
+        sys.stdout.buffer.write(profiles.pop().name + b'\n')
+    else:
+        say("Ambiguous profile: %s" % ", ".join([pr(p.name) for p in profiles]))
+        say("Run 'git filter --check' to identify the commit that " +
+            "introduces the ambiguity.")
+        sys.exit(2)
+
+# '--set-profile'
+def cmd_set_profile(config, args):
+    if len(args) < 2:
+        die("Too few arguments to '--set-profile'")
+    profile_name = args[0]
+    roots = []
+    for arg in args[1:]:
+        words = arg.split(b':', 1)
+        if len(words) == 2:
+            roots.append((words[0], rev_parse(words[1])))
+        else:
+            roots.append((None, rev_parse(words[0])))
+
+    profile = config.get_profile(profile_name)
+
+    for name, commit in roots:
+        # Check for an existing root for this profile with the same name.
+        if name:
+            root = profile.get_root(name)
+            if root:
+                if root.commit == commit:
+                    continue
+                die("Profile '%s' already has a root named '%s'" %
+                    (pr(profile.name), pr(name)))
+
+        # Check for an existing root (not necessarily for the same profile).
+        root = config.roots.get(commit)
+        if root is not None:
+            if root.profile is profile:
+                if name and name != root.name:
+                    say("Renaming '%s' to '%s'" % (root.name, name))
+                    root.rename(name)
+                continue
+            else:
+                config.remove_root(root)
+
+        # We now know 'commit' is not a root.
+        profiles = get_reachable_profiles(config, commit)
+        if len(profiles) == 1 and profiles.pop() is profile:
+            if name:
+                say("note: ref '%s' would be redundant; not adding it" % pr(name))
+            continue
+
+        # Add the root to our in-memory structures and add the ref.
+        if name is None:
+            name = profile.next_default_root_name()
+        root = Root(commit, profile, name)
+        config.add_root(root)
+        config.compute_root_coverage()
+        root.update_ref()
+
+    remove_redundant_roots(config, profile)
+
+class Command:
+    ACCEPTS_FLAGS  = 1 << 0
+    USES_WORK_TREE = 1 << 2
+
+    def __init__(self, name, fn, flags, usage, help):
+        self.name = name
+        self.fn = fn
+        self.flags = flags
+        self.usage = usage
+        self.help = help
+
+DEFAULT_COMMAND = Command(
+        None, cmd_filter,
+                Command.ACCEPTS_FLAGS |
+                Command.USES_WORK_TREE,
+        "", "")
+
+ABORT_COMMAND = Command("--abort", None, 0, "", """\
+Abort the current filter operation, restoring HEAD, the work tree and the index
+to the state they were in prior to the operation.
+""")
+
+CONTINUE_COMMAND = Command("--continue", None, 0, "", """\
+Resume the current filter operation after having resolved a merge.
+""")
+
+COMMANDS = [
+    # Special commands
+    ABORT_COMMAND,
+    CONTINUE_COMMAND,
+
+    # Normal commands
+    Command("--check", cmd_check, 0,
+            "", """\
+Check for any problems with the current git-filter configuration, including
+detecting if there are any commits with ambiguous profiles.
+"""),
+    Command("--profile-graph", cmd_profile_graph, 0,
+            "[<commits...>]", """\
+Display graph of profile root commits and any commits listed.
+"""),
+    Command("--profile-of", cmd_profile_of, 0,
+            "<commit>", """\
+Determine profile of the specified commit and print its name to standard output.
+"""),
+    Command("--set-profile", cmd_set_profile, 0,
+            "[-f] <profile> <commit> [<commits...>]", """\
+Set the profile of the specified commits and their descendents to <profile>.
+
+Each <commit> may be a single revision, or have the form "<name>:<revision>",
+where <name> is a descriptive name for the commit.
+"""),
+]
+
+def lookup_command(name):
+    return next((cmd for cmd in COMMANDS if cmd.name == name.decode('ascii')), None)
+
+def print_usage(out):
+    out.write("""\
+usage: git filter [-p <profile>] [<tip>] [<branch>|-]
+   or: git filter [--abort|--continue]
+""")
+    for cmd in COMMANDS:
+        if cmd is ABORT_COMMAND or cmd is CONTINUE_COMMAND:
+            continue
+        out.write("   or: git filter %s %s\n" % (cmd.name, cmd.usage))
+    out.write("""\
+Use 'git filter <command> -h' for help with a specific command.
+
+The default command (first form) filters commits from <tip> onto <branch>.  If
+<profile> is specified, commits will be filtered into the specified profile;
+otherwise, they will be filtered into the profile of the commit at the tip of
+<branch>. If <branch> doesn't exist yet, it will be created (the profile must be
+specified explicitly in this case). If <tip> is omitted it defaults to HEAD.
+If <branch> is '-', commits from <tip> will be filtered and the resulting tip
+will be printed to standard output.
+
+""")
+
+def print_command_usage(cmd, out):
+    out.write("usage: git filter %s %s\n\n%s" % (cmd.name, cmd.usage, cmd.help))
+
+def is_help_flag(arg):
+    return arg == b'-h' or arg == b'--help'
+
+def warn_additional_args(args):
+    if len(args) > 1:
+        warn("Ignoring additional arguments after '%s'." % pr(args[0]))
+
+def cleanup_work_tree():
+    if os.path.isfile(git_dir + b'/FILTER_ORIG_HEAD'):
+        run(['mv', git_dir + b'/FILTER_ORIG_HEAD', git_dir + b'/HEAD'])
+        run(['git', 'reset', '--hard', '-q'])
+    else:
+        sys.stderr.write("there is no filter operation in progress\n")
+
+def main():
+    global continuing, program_args
+
+    if len(sys.argv) < 2:
+        print_usage(sys.stderr)
+        sys.exit(1)
+
+    # Take arguments from the command line. We want to deal with arguments as
+    # byte strings - on Python 3 that means we must use 'os.fsencode' to convert
+    # them back to byte strings, as Python automatically decodes them using the
+    # user's locale.
+    args = sys.argv[1:]
+    if sys.version_info[0] > 2:
+        args = list(map(os.fsencode, args))
+
+    program_args = args
+
+    # Top-level help
+    if is_help_flag(args[0]):
+        warn_additional_args(args)
+        print_usage(sys.stdout)
+        sys.exit(0)
+
+    cmd = lookup_command(args[0])
+    if cmd is None:
+        cmd = DEFAULT_COMMAND
+    else:
+        args = args[1:]
+        if len(args) > 0 and is_help_flag(args[0]):
+            warn_additional_args(args)
+            print_command_uage(cmd, sys.stdout)
+            sys.exit(0)
+
+    global git_dir
+    git_dir = get_git_dir()
+
+    # If an operation is in progress, load the arguments for that operation.
+    prev_args = None
+    if os.path.isfile(git_dir + b'/FILTER_CMD'):
+        with open(git_dir + b'/FILTER_CMD', 'rb') as f:
+            prev_args = separate_strings(f.read(), b' ')
+        os.remove(git_dir + b'/FILTER_CMD')
+
+    if cmd is ABORT_COMMAND:
+        warn_additional_args(args)
+        cleanup_work_tree()
+        sys.exit(0)
+
+    if cmd is CONTINUE_COMMAND:
+        warn_additional_args(args)
+        if prev_args is None:
+            die("there is no filter operation in progress")
+        args = prev_args
+
+        cmd = lookup_command(args[0])
+        if cmd is None:
+            cmd = DEFAULT_COMMAND
+        else:
+            args = args[1:]
+
+        continuing = True
+        program_args = args
+
+    # Check flags
+    if b'--' in args:
+        die("git-filter does not support '--'")
+    if (cmd.flags & Command.ACCEPTS_FLAGS) == 0:
+        if len([a for a in args if a[0] == ord('-')]) > 0:
+            die("Unknown flag '%s'" % pr(args[0]))
+
+    # Check work tree state
+    if cmd.flags & Command.USES_WORK_TREE:
+        if run_test(['git', 'rev-parse', '--verify', 'HEAD'],
+                    PIPE_STDOUT | PIPE_STDERR) != 0:
+            die("no commits")
+
+        if (run_test(['git', 'update-index', '--ignore-submodules', '--refresh']) != 0
+         or run_test(['git', 'diff-files', '--quiet', '--ignore-submodules']) != 0
+         or run_test(['git', 'diff-index', '--cached', '--quiet',
+                      '--ignore-submodules', 'HEAD', '--'])):
+            if continuing:
+                if run_output(['git', 'ls-files', '-u']).strip():
+                    interrupt(None, "there are still unresolved changes")
+            else:
+                die("you have uncommitted changes; commit or stash them first")
+
+        if not continuing:
+            run(['cp', git_dir + b'/HEAD',
+                git_dir + b'/FILTER_ORIG_HEAD'])
+
+    # Load configuration and cache.
+    config = Config()
+    config.load_profiles()
+    config.load_filters()
+    config.load_cache()
+    config.compute_root_coverage()
+    config.load_tips()
+    config.save_cache_if_dirty()
+
+    cmd.fn(config, args)
+
+    config.save_cache_if_dirty()
+
+    if cmd.flags & Command.USES_WORK_TREE:
+        cleanup_work_tree()
+
+if __name__ == '__main__':
+    main()
